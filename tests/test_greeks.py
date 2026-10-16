@@ -1,64 +1,100 @@
-"""Unit Tests for Option Greeks and Risk Sensitivities.
+"""Automated Unit Tests for Analytical Option Greeks.
 
 Role:
-    Validates mathematical properties, sign constraints, and theoretical bounds
-    of analytical Greeks (Delta, Gamma, Vega, Theta, Rho) for European equity
-    and index options under continuous dividend yields.
-
-Dependencies:
-    - pytest: Test framework
-    - numpy: Numerical calculations and assertion support
-    - models.bs_engine: OptionType
-    - models.greeks: GreekCalculator, GreeksResult
-
-Core Test Cases to be Implemented:
-    - test_call_delta_sign_and_bounds: Call Delta strictly within [0, 1] (or [0, exp(-q*T)]).
-    - test_put_delta_sign_and_bounds: Put Delta strictly within [-1, 0] (or [-exp(-q*T), 0]).
-    - test_gamma_strictly_positive: Gamma strictly positive (> 0) for long options.
-    - test_vega_strictly_positive: Vega strictly positive (> 0) for long options.
-    - test_call_theta_sign: Theta typically negative (< 0) reflecting time decay.
-    - test_call_rho_sign: Call Rho positive (> 0) with respect to interest rate.
-    - test_put_rho_sign: Put Rho negative (< 0) with respect to interest rate.
+    Validates analytical bounds, parity relationships, positivity constraints,
+    and time decay signs for Black-Scholes-Merton Greeks (Delta, Gamma, Vega,
+    Theta, Rho) across scalar and vectorized inputs.
 """
 
-import pytest
+from __future__ import annotations
+
 import numpy as np
+import pytest
 
-from models.bs_engine import OptionType
-from models.greeks import GreekCalculator, GreeksResult
+from models.greeks import GreeksCalculator
 
 
-class TestGreeks:
-    """Test suite for analytical Greek signs, bounds, and sensitivity constraints."""
+def test_delta_bounds() -> None:
+    """Verify Call/Put Delta bounds and Call-Put Delta parity relationship."""
+    calc = GreeksCalculator()
+    spots = np.linspace(700.0, 1300.0, 50)
+    K = 1000.0
+    T = 0.5
+    r = 0.015
+    q = 0.022
+    sigma = 0.25
 
-    def setup_method(self) -> None:
-        """Set up test fixtures before each test method execution."""
-        pass
+    call_deltas = calc.delta(spots, K, T, r, q, sigma, option_type="call")
+    put_deltas = calc.delta(spots, K, T, r, q, sigma, option_type="put")
 
-    def test_call_delta_sign_and_bounds(self) -> None:
-        """Verify that Call Delta is bounded in [0, 1]."""
-        pass
+    # Call Delta strictly within [0.0, 1.0]
+    assert np.all((call_deltas >= 0.0) & (call_deltas <= 1.0))
 
-    def test_put_delta_sign_and_bounds(self) -> None:
-        """Verify that Put Delta is bounded in [-1, 0]."""
-        pass
+    # Put Delta strictly within [-1.0, 0.0]
+    assert np.all((put_deltas >= -1.0) & (put_deltas <= 0.0))
 
-    def test_gamma_strictly_positive(self) -> None:
-        """Verify that Gamma is strictly positive (> 0) across all strikes and spots."""
-        pass
+    # Delta parity: Delta_Call - Delta_Put == exp(-q * T)
+    expected_diff = np.exp(-q * T)
+    assert np.allclose(call_deltas - put_deltas, expected_diff, atol=1e-7)
 
-    def test_vega_strictly_positive(self) -> None:
-        """Verify that Vega is strictly positive (> 0) across all strikes and spots."""
-        pass
 
-    def test_call_theta_sign(self) -> None:
-        """Verify that Theta for standard European calls is negative (< 0)."""
-        pass
+def test_gamma_vega_positivity() -> None:
+    """Verify Gamma and Vega are strictly positive (> 0) for non-expired options."""
+    calc = GreeksCalculator()
+    spots = np.linspace(800.0, 1200.0, 25)
+    K = 1000.0
+    T = 0.5
+    r = 0.015
+    q = 0.022
+    sigma = 0.28
 
-    def test_call_rho_sign(self) -> None:
-        """Verify that Call Rho is positive (> 0)."""
-        pass
+    gammas = calc.gamma(spots, K, T, r, q, sigma)
+    vegas = calc.vega(spots, K, T, r, q, sigma)
 
-    def test_put_rho_sign(self) -> None:
-        """Verify that Put Rho is negative (< 0)."""
-        pass
+    assert np.all(gammas > 0.0)
+    assert np.all(vegas > 0.0)
+
+    # Boundary check at expiration (T = 0): Gamma and Vega must be 0.0
+    assert calc.gamma(1000.0, K, 0.0, r, q, sigma) == 0.0
+    assert calc.vega(1000.0, K, 0.0, r, q, sigma) == 0.0
+
+
+def test_theta_decay_sign() -> None:
+    """Verify ATM Call and Put Theta are strictly negative (decaying with time)."""
+    calc = GreeksCalculator()
+    S = 1000.0
+    K = 1000.0
+    T = 0.25
+    r = 0.015
+    q = 0.020
+    sigma = 0.25
+
+    call_theta = calc.theta(S, K, T, r, q, sigma, option_type="call")
+    put_theta = calc.theta(S, K, T, r, q, sigma, option_type="put")
+
+    assert isinstance(call_theta, float)
+    assert isinstance(put_theta, float)
+    assert call_theta < 0.0
+    assert put_theta < 0.0
+
+
+def test_rho_and_all_greeks_reporting() -> None:
+    """Verify Rho signs and all_greeks dictionary structure."""
+    calc = GreeksCalculator()
+    S = 1000.0
+    K = 1000.0
+    T = 0.5
+    r = 0.015
+    q = 0.022
+    sigma = 0.25
+
+    call_greeks = calc.all_greeks(S, K, T, r, q, sigma, option_type="call")
+    put_greeks = calc.all_greeks(S, K, T, r, q, sigma, option_type="put")
+
+    expected_keys = {"delta", "gamma", "vega", "theta", "rho"}
+    assert set(call_greeks.keys()) == expected_keys
+    assert set(put_greeks.keys()) == expected_keys
+
+    # Call Rho > 0, Put Rho < 0 for T > 0
+    assert call_greeks["rho"] > 0.0
+    assert put_greeks["rho"] < 0.0

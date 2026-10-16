@@ -22,7 +22,7 @@ Core Classes & Functions Exposed:
 """
 
 from .bs_engine import BSEngine, OptionType, black_scholes_price
-from .greeks import GreekCalculator, GreeksResult, calculate_all_greeks
+from .greeks import GreekCalculator, GreeksCalculator, GreeksResult, calculate_all_greeks
 from .volatility import (
     HistoricalVolatility,
     ImpliedVolatilitySolver,
@@ -36,6 +36,7 @@ __all__ = [
     "BSEngine",
     "OptionType",
     "black_scholes_price",
+    "GreeksCalculator",
     "GreekCalculator",
     "GreeksResult",
     "calculate_all_greeks",

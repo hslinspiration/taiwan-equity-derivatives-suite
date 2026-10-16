@@ -1,52 +1,112 @@
-"""Unit Tests for Black-Scholes-Merton Pricing Engine.
+"""Automated Unit Tests for the Vectorized Black-Scholes-Merton Pricing Engine.
 
 Role:
-    Validates theoretical pricing properties of the Black-Scholes-Merton model with
-    continuous dividend yield, focusing on European Put-Call Parity integrity and
-    deep in-the-money (ITM) / out-of-the-money (OTM) asymptotic boundary limits.
-
-Dependencies:
-    - pytest: Test framework
-    - numpy: Numerical calculations and assertion support
-    - models.bs_engine: BSEngine, OptionType, black_scholes_price
-
-Core Test Cases to be Implemented:
-    - test_put_call_parity: European Put-Call parity holds (C - P = S*exp(-q*T) - K*exp(-r*T)).
-    - test_deep_itm_call_boundary: Deep ITM Call price converges to S*exp(-q*T) - K*exp(-r*T).
-    - test_deep_otm_call_boundary: Deep OTM Call price converges to 0.
-    - test_deep_itm_put_boundary: Deep ITM Put price converges to K*exp(-r*T) - S*exp(-q*T).
-    - test_deep_otm_put_boundary: Deep OTM Put price converges to 0.
+    Validates European Put-Call parity across moneyness regimes (ITM, ATM, OTM),
+    expiration boundary behavior (T <= 0), zero-volatility limits (sigma <= 0),
+    and NumPy array vectorization for spot and strike price grids.
 """
 
-import pytest
+from __future__ import annotations
+
 import numpy as np
+import pytest
 
-from models.bs_engine import BSEngine, OptionType, black_scholes_price
+from models.bs_engine import BSEngine
 
 
-class TestBSEngine:
-    """Test suite for BSEngine analytical properties and boundary conditions."""
+def test_put_call_parity() -> None:
+    """Verify Call - Put == S * exp(-q * T) - K * exp(-r * T) across ITM, ATM, and OTM strikes."""
+    engine = BSEngine()
+    S = 1000.0
+    T = 0.5
+    r = 0.015
+    q = 0.022
+    sigma = 0.28
 
-    def setup_method(self) -> None:
-        """Set up test fixtures before each test method execution."""
-        pass
+    # Strikes spanning ITM, ATM, and OTM regimes
+    strikes = [800.0, 900.0, 1000.0, 1100.0, 1200.0]
 
-    def test_put_call_parity(self) -> None:
-        """Validate European Put-Call parity condition across strikes and maturities."""
-        pass
+    for K in strikes:
+        call = engine.call_price(S, K, T, r, q, sigma)
+        put = engine.put_price(S, K, T, r, q, sigma)
+        lhs = call - put
+        rhs = S * np.exp(-q * T) - K * np.exp(-r * T)
+        assert abs(lhs - rhs) < 1e-7, (
+            f"Put-Call parity failed at strike K={K}: |{lhs} - {rhs}| = {abs(lhs - rhs)}"
+        )
 
-    def test_deep_itm_call_boundary(self) -> None:
-        """Verify that when S >> K, Call price converges to S*exp(-q*T) - K*exp(-r*T)."""
-        pass
 
-    def test_deep_otm_call_boundary(self) -> None:
-        """Verify that when S << K, Call price converges asymptotically to 0."""
-        pass
+def test_expiration_boundary() -> None:
+    """Verify that when T = 0, call_price == max(S - K, 0) and put_price == max(K - S, 0)."""
+    engine = BSEngine()
+    r = 0.015
+    q = 0.022
+    sigma = 0.25
 
-    def test_deep_itm_put_boundary(self) -> None:
-        """Verify that when S << K, Put price converges to K*exp(-r*T) - S*exp(-q*T)."""
-        pass
+    test_cases = [
+        (1050.0, 1000.0),  # Call ITM / Put OTM
+        (1000.0, 1000.0),  # ATM
+        (920.0, 1000.0),   # Call OTM / Put ITM
+    ]
 
-    def test_deep_otm_put_boundary(self) -> None:
-        """Verify that when S >> K, Put price converges asymptotically to 0."""
-        pass
+    for S, K in test_cases:
+        call_t0 = engine.call_price(S, K, 0.0, r, q, sigma)
+        put_t0 = engine.put_price(S, K, 0.0, r, q, sigma)
+
+        expected_call = max(S - K, 0.0)
+        expected_put = max(K - S, 0.0)
+
+        assert isinstance(call_t0, float)
+        assert isinstance(put_t0, float)
+        assert abs(call_t0 - expected_call) < 1e-12
+        assert abs(put_t0 - expected_put) < 1e-12
+
+        # Also verify negative T edge case defense
+        assert abs(engine.call_price(S, K, -0.01, r, q, sigma) - expected_call) < 1e-12
+        assert abs(engine.put_price(S, K, -0.01, r, q, sigma) - expected_put) < 1e-12
+
+
+def test_vectorized_inputs() -> None:
+    """Pass a NumPy array of spot prices and verify output is a matching ndarray."""
+    engine = BSEngine()
+    spots = np.linspace(800.0, 1200.0, 50)
+    K = 1000.0
+    T = 0.25
+    r = 0.015
+    q = 0.022
+    sigma = 0.25
+
+    calls = engine.call_price(spots, K, T, r, q, sigma)
+    puts = engine.put_price(spots, K, T, r, q, sigma)
+
+    assert isinstance(calls, np.ndarray)
+    assert isinstance(puts, np.ndarray)
+    assert calls.shape == spots.shape
+    assert puts.shape == spots.shape
+
+    # Call prices must be monotonically increasing in spot S; Puts monotonically decreasing
+    assert np.all(np.diff(calls) > 0.0)
+    assert np.all(np.diff(puts) < 0.0)
+
+    # Vectorized Put-Call parity check across the entire array
+    parity_diff = (calls - puts) - (spots * np.exp(-q * T) - K * np.exp(-r * T))
+    assert np.all(np.abs(parity_diff) < 1e-7)
+
+
+def test_zero_volatility_boundary() -> None:
+    """Verify discounted intrinsic payoff when sigma <= 0."""
+    engine = BSEngine()
+    S = 1050.0
+    K = 1000.0
+    T = 0.5
+    r = 0.015
+    q = 0.02
+
+    call_zero_vol = engine.call_price(S, K, T, r, q, 0.0)
+    put_zero_vol = engine.put_price(S, K, T, r, q, 0.0)
+
+    expected_call = max(S * np.exp(-q * T) - K * np.exp(-r * T), 0.0)
+    expected_put = max(K * np.exp(-r * T) - S * np.exp(-q * T), 0.0)
+
+    assert abs(call_zero_vol - expected_call) < 1e-12
+    assert abs(put_zero_vol - expected_put) < 1e-12

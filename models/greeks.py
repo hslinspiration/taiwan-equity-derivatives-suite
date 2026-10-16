@@ -1,43 +1,28 @@
-"""Option Greeks and Risk Sensitivities Analytics Engine.
+"""Analytical Option Greeks and Risk Sensitivities Engine.
 
 Role:
-    Computes analytical first-order, second-order, and cross Greeks for European
-    options under the Merton (1973) continuous dividend yield framework.
-    Also provides numerical finite-difference bump-and-reprice estimators
-    used to cross-validate analytical Greek derivatives against model errors.
+    Computes closed-form analytical first- and second-order Greeks (Delta, Gamma,
+    Vega, Theta, Rho) for European options under the Merton (1973) continuous
+    dividend yield extension of the Black-Scholes-Merton framework. All methods
+    support both scalar floats and vectorized NumPy arrays (`np.ndarray`).
 
-Dependencies:
-    - dataclasses: Structured container for Greek sensitivity metrics
-    - typing: Static typing annotations (Dict, Optional, Union)
-    - numpy: Vectorized array calculations and math functions
-    - scipy.stats: Normal distribution functions (norm.pdf, norm.cdf)
-    - config: Global configuration parameters
-    - .bs_engine: Core Black-Scholes-Merton engine and OptionType enum
-
-Core Classes to be Implemented:
-    - GreeksResult: Immutable dataclass encapsulating all calculated Greeks
-      (Delta, Gamma, Vega, Theta, Rho, Vanna, Volga, Charm).
-    - GreekCalculator: Engine offering both analytical formulas and numerical
-      finite-difference calculations.
-
-Core Functions to be Implemented:
-    - delta: First derivative with respect to underlying spot price (dV/dS).
-    - gamma: Second derivative with respect to underlying spot price (d2V/dS2).
-    - vega: First derivative with respect to volatility (dV/dsigma).
-    - theta: First derivative with respect to time decay (dV/dt).
-    - rho: First derivative with respect to risk-free rate (dV/dr).
-    - vanna: Cross derivative with respect to spot and volatility (d2V/dS dsigma).
-    - volga: Second derivative with respect to volatility (d2V/dsigma2).
-    - charm: Cross derivative with respect to spot and time decay (dDelta/dt).
-    - calculate_all_greeks: Aggregate calculation returning a populated GreeksResult instance.
+Conventions & Scaling:
+    - Delta (dV/dS): First partial derivative with respect to spot price S.
+    - Gamma (d^2V/dS^2): Second partial derivative with respect to spot price S.
+    - Vega (dV/dsigma): Normalized to a 1% (0.01) absolute change in implied volatility.
+    - Theta (dV/dt): Normalized to 1 calendar day time decay (Annual Theta / 365.0).
+    - Rho (dV/dr): Normalized to a 1% (0.01) absolute change in the risk-free rate.
 """
 
-from dataclasses import dataclass
-from typing import Optional, Union
-import numpy as np
+from __future__ import annotations
 
-from config import DEFAULT_CONFIG, SystemConfig
-from .bs_engine import OptionType
+from dataclasses import dataclass
+from typing import Dict, Optional, Union
+import numpy as np
+from scipy.stats import norm
+
+import config
+from .bs_engine import ArrayLikeFloat, BSEngine, OptionType, _is_vector_input
 
 
 @dataclass(frozen=True)
@@ -46,175 +31,367 @@ class GreeksResult:
 
     Attributes:
         delta: Sensitivity to underlying price (dV/dS).
-        gamma: Rate of change of delta per unit move in spot (d2V/dS2).
-        vega: Sensitivity to 1% (or 100 bps) change in volatility (dV/dsigma).
-        theta: Daily time decay sensitivity (dV/dt per calendar day).
-        rho: Sensitivity to 1% change in risk-free interest rate (dV/dr).
-        epsilon: Sensitivity to 1% change in continuous dividend yield (dV/dq).
-        vanna: Cross-sensitivity of delta to volatility or vega to spot.
-        volga: Sensitivity of vega to volatility (convexity of vega).
-        charm: Rate of change of delta over time decay (delta bleed).
+        gamma: Rate of change of delta per unit move in spot (d^2V/dS^2).
+        vega: Sensitivity to 1% (0.01) change in volatility.
+        theta: Daily time decay sensitivity (annual Theta / 365.0).
+        rho: Sensitivity to 1% (0.01) change in risk-free interest rate.
     """
-    delta: float
-    gamma: float
-    vega: float
-    theta: float
-    rho: float
-    epsilon: float
-    vanna: float
-    volga: float
-    charm: float
+
+    delta: ArrayLikeFloat
+    gamma: ArrayLikeFloat
+    vega: ArrayLikeFloat
+    theta: ArrayLikeFloat
+    rho: ArrayLikeFloat
 
 
-class GreekCalculator:
-    """Quantitative calculator for option Greeks and sensitivity analytics."""
+def _normalize_option_type(option_type: Union[OptionType, str]) -> str:
+    """Validate and normalize option_type to lowercase 'call' or 'put'."""
+    opt = option_type.value if isinstance(option_type, OptionType) else str(option_type).strip().lower()
+    if opt not in ("call", "put"):
+        raise ValueError(f"Invalid option_type '{option_type}'. Expected 'call' or 'put'.")
+    return opt
 
-    def __init__(self, config: Optional[SystemConfig] = None) -> None:
-        """Initialize GreekCalculator with system configuration.
+
+class GreeksCalculator:
+    """Closed-form analytical calculator for Black-Scholes-Merton option Greeks.
+
+    Supports both scalar `float` and `np.ndarray` inputs across all methods.
+    """
+
+    def __init__(self, system_config: Optional[config.SystemConfig] = None) -> None:
+        """Initialize GreeksCalculator with optional system configuration."""
+        self.config: config.SystemConfig = system_config or config.DEFAULT_CONFIG
+
+    @staticmethod
+    def delta(
+        S: ArrayLikeFloat,
+        K: ArrayLikeFloat,
+        T: ArrayLikeFloat,
+        r: float,
+        q: float,
+        sigma: ArrayLikeFloat,
+        option_type: Union[OptionType, str] = "call",
+    ) -> ArrayLikeFloat:
+        """Compute analytical BSM option Delta.
+
+        Formulas:
+            Call Delta = exp(-q * T) * norm.cdf(d1)
+            Put Delta  = -exp(-q * T) * norm.cdf(-d1)
 
         Args:
-            config: Optional system configuration instance.
+            S: Underlying spot price(s).
+            K: Option strike price(s).
+            T: Time to maturity in years.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+            option_type: 'call' or 'put' (defaults to 'call').
+
+        Returns:
+            float | np.ndarray: Option Delta value(s).
         """
-        self.config = config or DEFAULT_CONFIG
+        opt = _normalize_option_type(option_type)
+        is_vec = _is_vector_input(S, K, T, r, q, sigma)
+        s_arr = np.asarray(S, dtype=float)
+        k_arr = np.asarray(K, dtype=float)
+        t_arr = np.asarray(T, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
 
-    def delta(
-        self,
-        option_type: Union[OptionType, str],
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Delta calculation."""
-        raise NotImplementedError("Analytical delta will be implemented.")
+        if np.all(t_arr <= 0.0):
+            if opt == "call":
+                exp_delta = np.where(s_arr > k_arr, 1.0, np.where(s_arr == k_arr, 0.5, 0.0))
+            else:
+                exp_delta = np.where(s_arr < k_arr, -1.0, np.where(s_arr == k_arr, -0.5, 0.0))
+            return np.asarray(exp_delta, dtype=float) if is_vec else float(exp_delta)
 
+        d1_val = np.asarray(BSEngine.d1(s_arr, k_arr, t_arr, r, q, sigma_arr), dtype=float)
+        df_q = np.exp(-q * t_arr)
+
+        if opt == "call":
+            bsm_delta = df_q * norm.cdf(d1_val)
+            expiry_fallback = np.where(s_arr > k_arr, 1.0, 0.0)
+        else:
+            bsm_delta = -df_q * norm.cdf(-d1_val)
+            expiry_fallback = np.where(s_arr < k_arr, -1.0, 0.0)
+
+        result = np.where((t_arr <= 0.0) | (sigma_arr <= 0.0), expiry_fallback, bsm_delta)
+        return np.asarray(result, dtype=float) if is_vec else float(result)
+
+    @staticmethod
     def gamma(
-        self,
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Gamma calculation."""
-        raise NotImplementedError("Analytical gamma will be implemented.")
+        S: ArrayLikeFloat,
+        K: ArrayLikeFloat,
+        T: ArrayLikeFloat,
+        r: float,
+        q: float,
+        sigma: ArrayLikeFloat,
+    ) -> ArrayLikeFloat:
+        """Compute analytical BSM option Gamma (identical for Call and Put).
 
+        Formula:
+            Gamma = (exp(-q * T) * norm.pdf(d1)) / (S * sigma * sqrt(T))
+
+        Boundary:
+            When T <= 0 or sigma <= 0, returns 0.0.
+
+        Args:
+            S: Underlying spot price(s).
+            K: Option strike price(s).
+            T: Time to maturity in years.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            float | np.ndarray: Option Gamma value(s).
+        """
+        is_vec = _is_vector_input(S, K, T, r, q, sigma)
+        s_arr = np.asarray(S, dtype=float)
+        k_arr = np.asarray(K, dtype=float)
+        t_arr = np.asarray(T, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
+
+        if np.all(t_arr <= 0.0) or np.all(sigma_arr <= 0.0):
+            zeros = np.zeros_like(s_arr + k_arr + t_arr + sigma_arr, dtype=float)
+            return np.asarray(zeros, dtype=float) if is_vec else 0.0
+
+        d1_val = np.asarray(BSEngine.d1(s_arr, k_arr, t_arr, r, q, sigma_arr), dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            numerator = np.exp(-q * t_arr) * norm.pdf(d1_val)
+            denominator = s_arr * sigma_arr * np.sqrt(t_arr)
+            result = np.where((t_arr > 0.0) & (sigma_arr > 0.0), numerator / denominator, 0.0)
+
+        return np.asarray(result, dtype=float) if is_vec else float(result)
+
+    @staticmethod
     def vega(
-        self,
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Vega calculation per 1% change in implied volatility."""
-        raise NotImplementedError("Analytical vega will be implemented.")
+        S: ArrayLikeFloat,
+        K: ArrayLikeFloat,
+        T: ArrayLikeFloat,
+        r: float,
+        q: float,
+        sigma: ArrayLikeFloat,
+    ) -> ArrayLikeFloat:
+        """Compute analytical BSM option Vega normalized to a 1% (0.01) volatility change.
 
+        Formula:
+            Vega = 0.01 * S * exp(-q * T) * sqrt(T) * norm.pdf(d1)
+
+        Boundary:
+            When T <= 0 or sigma <= 0, returns 0.0.
+
+        Args:
+            S: Underlying spot price(s).
+            K: Option strike price(s).
+            T: Time to maturity in years.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            float | np.ndarray: Option Vega value(s) per 1% volatility point.
+        """
+        is_vec = _is_vector_input(S, K, T, r, q, sigma)
+        s_arr = np.asarray(S, dtype=float)
+        k_arr = np.asarray(K, dtype=float)
+        t_arr = np.asarray(T, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
+
+        if np.all(t_arr <= 0.0) or np.all(sigma_arr <= 0.0):
+            zeros = np.zeros_like(s_arr + k_arr + t_arr + sigma_arr, dtype=float)
+            return np.asarray(zeros, dtype=float) if is_vec else 0.0
+
+        d1_val = np.asarray(BSEngine.d1(s_arr, k_arr, t_arr, r, q, sigma_arr), dtype=float)
+        with np.errstate(invalid="ignore"):
+            raw_vega = 0.01 * s_arr * np.exp(-q * t_arr) * np.sqrt(t_arr) * norm.pdf(d1_val)
+            result = np.where((t_arr > 0.0) & (sigma_arr > 0.0), raw_vega, 0.0)
+
+        return np.asarray(result, dtype=float) if is_vec else float(result)
+
+    @staticmethod
     def theta(
-        self,
-        option_type: Union[OptionType, str],
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical 1-day Theta calculation."""
-        raise NotImplementedError("Analytical theta will be implemented.")
+        S: ArrayLikeFloat,
+        K: ArrayLikeFloat,
+        T: ArrayLikeFloat,
+        r: float,
+        q: float,
+        sigma: ArrayLikeFloat,
+        option_type: Union[OptionType, str] = "call",
+    ) -> ArrayLikeFloat:
+        """Compute analytical BSM option Theta normalized to 1 calendar day decay (/ 365.0).
 
+        Formulas:
+            Term1      = - (S * exp(-q * T) * norm.pdf(d1) * sigma) / (2 * sqrt(T))
+            Call Theta = (Term1 - r * K * exp(-r * T) * norm.cdf(d2)
+                          + q * S * exp(-q * T) * norm.cdf(d1)) / 365.0
+            Put Theta  = (Term1 + r * K * exp(-r * T) * norm.cdf(-d2)
+                          - q * S * exp(-q * T) * norm.cdf(-d1)) / 365.0
+
+        Boundary:
+            When T <= 0 or sigma <= 0, returns 0.0.
+
+        Args:
+            S: Underlying spot price(s).
+            K: Option strike price(s).
+            T: Time to maturity in years.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+            option_type: 'call' or 'put' (defaults to 'call').
+
+        Returns:
+            float | np.ndarray: Daily Option Theta value(s).
+        """
+        opt = _normalize_option_type(option_type)
+        is_vec = _is_vector_input(S, K, T, r, q, sigma)
+        s_arr = np.asarray(S, dtype=float)
+        k_arr = np.asarray(K, dtype=float)
+        t_arr = np.asarray(T, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
+
+        if np.all(t_arr <= 0.0) or np.all(sigma_arr <= 0.0):
+            zeros = np.zeros_like(s_arr + k_arr + t_arr + sigma_arr, dtype=float)
+            return np.asarray(zeros, dtype=float) if is_vec else 0.0
+
+        d1_val = np.asarray(BSEngine.d1(s_arr, k_arr, t_arr, r, q, sigma_arr), dtype=float)
+        d2_val = np.asarray(BSEngine.d2(s_arr, k_arr, t_arr, r, q, sigma_arr), dtype=float)
+
+        df_q = np.exp(-q * t_arr)
+        df_r = np.exp(-r * t_arr)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            term1 = -(s_arr * df_q * norm.pdf(d1_val) * sigma_arr) / (2.0 * np.sqrt(t_arr))
+            if opt == "call":
+                annual_theta = (
+                    term1
+                    - r * k_arr * df_r * norm.cdf(d2_val)
+                    + q * s_arr * df_q * norm.cdf(d1_val)
+                )
+            else:
+                annual_theta = (
+                    term1
+                    + r * k_arr * df_r * norm.cdf(-d2_val)
+                    - q * s_arr * df_q * norm.cdf(-d1_val)
+                )
+            daily_theta = annual_theta / 365.0
+            result = np.where((t_arr > 0.0) & (sigma_arr > 0.0), daily_theta, 0.0)
+
+        return np.asarray(result, dtype=float) if is_vec else float(result)
+
+    @staticmethod
     def rho(
-        self,
-        option_type: Union[OptionType, str],
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Rho calculation per 1% change in risk-free rate."""
-        raise NotImplementedError("Analytical rho will be implemented.")
+        S: ArrayLikeFloat,
+        K: ArrayLikeFloat,
+        T: ArrayLikeFloat,
+        r: float,
+        q: float,
+        sigma: ArrayLikeFloat,
+        option_type: Union[OptionType, str] = "call",
+    ) -> ArrayLikeFloat:
+        """Compute analytical BSM option Rho normalized to a 1% (0.01) interest rate change.
 
-    def vanna(
-        self,
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Vanna (dDelta/dSigma)."""
-        raise NotImplementedError("Analytical vanna will be implemented.")
+        Formulas:
+            Call Rho = 0.01 * K * T * exp(-r * T) * norm.cdf(d2)
+            Put Rho  = -0.01 * K * T * exp(-r * T) * norm.cdf(-d2)
 
-    def volga(
-        self,
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Volga / Vomma (dVega/dSigma)."""
-        raise NotImplementedError("Analytical volga will be implemented.")
+        Boundary:
+            When T <= 0 or sigma <= 0, returns 0.0.
 
-    def charm(
-        self,
-        option_type: Union[OptionType, str],
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> float:
-        """Analytical Charm (dDelta/dt)."""
-        raise NotImplementedError("Analytical charm will be implemented.")
+        Args:
+            S: Underlying spot price(s).
+            K: Option strike price(s).
+            T: Time to maturity in years.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+            option_type: 'call' or 'put' (defaults to 'call').
 
-    def compute_all(
-        self,
-        option_type: Union[OptionType, str],
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> GreeksResult:
-        """Calculate complete suite of option Greeks and return structured result."""
-        raise NotImplementedError("compute_all will be implemented.")
+        Returns:
+            float | np.ndarray: Option Rho value(s) per 1% rate move.
+        """
+        opt = _normalize_option_type(option_type)
+        is_vec = _is_vector_input(S, K, T, r, q, sigma)
+        s_arr = np.asarray(S, dtype=float)
+        k_arr = np.asarray(K, dtype=float)
+        t_arr = np.asarray(T, dtype=float)
+        sigma_arr = np.asarray(sigma, dtype=float)
 
-    def numerical_greeks(
-        self,
-        option_type: Union[OptionType, str],
-        spot: float,
-        strike: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> GreeksResult:
-        """Compute Greeks using central finite differences for cross-validation."""
-        raise NotImplementedError("numerical_greeks will be implemented.")
+        if np.all(t_arr <= 0.0) or np.all(sigma_arr <= 0.0):
+            zeros = np.zeros_like(s_arr + k_arr + t_arr + sigma_arr, dtype=float)
+            return np.asarray(zeros, dtype=float) if is_vec else 0.0
+
+        d2_val = np.asarray(BSEngine.d2(s_arr, k_arr, t_arr, r, q, sigma_arr), dtype=float)
+        df_r = np.exp(-r * t_arr)
+
+        if opt == "call":
+            raw_rho = 0.01 * k_arr * t_arr * df_r * norm.cdf(d2_val)
+        else:
+            raw_rho = -0.01 * k_arr * t_arr * df_r * norm.cdf(-d2_val)
+
+        result = np.where((t_arr > 0.0) & (sigma_arr > 0.0), raw_rho, 0.0)
+        return np.asarray(result, dtype=float) if is_vec else float(result)
+
+    @classmethod
+    def all_greeks(
+        cls,
+        S: ArrayLikeFloat,
+        K: ArrayLikeFloat,
+        T: ArrayLikeFloat,
+        r: float,
+        q: float,
+        sigma: ArrayLikeFloat,
+        option_type: Union[OptionType, str] = "call",
+    ) -> Dict[str, ArrayLikeFloat]:
+        """Compute all 5 primary BSM Greeks and return as a dictionary.
+
+        Args:
+            S: Underlying spot price(s).
+            K: Option strike price(s).
+            T: Time to maturity in years.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+            option_type: 'call' or 'put' (defaults to 'call').
+
+        Returns:
+            dict: Dictionary with keys 'delta', 'gamma', 'vega', 'theta', 'rho'.
+        """
+        return {
+            "delta": cls.delta(S, K, T, r, q, sigma, option_type=option_type),
+            "gamma": cls.gamma(S, K, T, r, q, sigma),
+            "vega": cls.vega(S, K, T, r, q, sigma),
+            "theta": cls.theta(S, K, T, r, q, sigma, option_type=option_type),
+            "rho": cls.rho(S, K, T, r, q, sigma, option_type=option_type),
+        }
+
+
+# Backward-compatible class alias
+GreekCalculator = GreeksCalculator
 
 
 def calculate_all_greeks(
     option_type: Union[OptionType, str],
-    spot: float,
-    strike: float,
-    time_to_maturity: float,
-    volatility: float,
-    risk_free_rate: float = 0.016,
+    spot: ArrayLikeFloat,
+    strike: ArrayLikeFloat,
+    time_to_maturity: ArrayLikeFloat,
+    volatility: ArrayLikeFloat,
+    risk_free_rate: float = config.FALLBACK_RISK_FREE_RATE,
     dividend_yield: float = 0.035,
 ) -> GreeksResult:
-    """Helper function to evaluate all Greeks for given contract parameters."""
-    calculator = GreekCalculator()
-    return calculator.compute_all(
-        option_type, spot, strike, time_to_maturity, volatility, risk_free_rate, dividend_yield
+    """Evaluate all 5 primary Greeks and return a structured GreeksResult container."""
+    greeks_dict = GreeksCalculator.all_greeks(
+        S=spot,
+        K=strike,
+        T=time_to_maturity,
+        r=risk_free_rate,
+        q=dividend_yield,
+        sigma=volatility,
+        option_type=option_type,
+    )
+    return GreeksResult(
+        delta=greeks_dict["delta"],
+        gamma=greeks_dict["gamma"],
+        vega=greeks_dict["vega"],
+        theta=greeks_dict["theta"],
+        rho=greeks_dict["rho"],
     )

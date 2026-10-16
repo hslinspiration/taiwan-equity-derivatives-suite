@@ -1,0 +1,28 @@
+# Taiwan Equity Derivatives Suite - Core Dependencies
+# Production-grade financial engineering & options analytics
+
+# Numerical & Scientific Computing
+numpy>=1.24.0,<2.2.0
+scipy>=1.10.0,<1.15.0
+pandas>=2.0.0,<2.3.0
+
+# Market Data Acquisition & Financial Tooling
+yfinance>=0.2.35
+requests>=2.31.0
+
+# Visualization & Interactive Reporting
+matplotlib>=3.7.0,<4.0.0
+seaborn>=0.12.0,<0.14.0
+plotly>=5.18.0,<6.0.0
+
+# Configuration & Data Validation
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0
+
+# Testing & Quality Assurance
+pytest>=7.4.0,<9.0.0
+pytest-cov>=4.1.0
+
+# Code Quality & Formatting
+ruff>=0.1.9
+mypy>=1.8.0

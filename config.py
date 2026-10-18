@@ -48,6 +48,21 @@ OPTION_TRANSACTION_TAX: float = 0.00002
 BROKERAGE_FEE_RATE: float = 0.001425
 """Standard TWSE/TPEx brokerage commission rate (0.1425%) before institutional discount."""
 
+# =====================================================================
+# Institutional Desk Quote Calibration Defaults
+# =====================================================================
+DEFAULT_SKEW_BETA: float = 0.45
+"""Default volatility skew slope across log-moneyness (4.5 vol points per 10% moneyness)."""
+
+DEFAULT_BORROW_COST: float = 0.020
+"""Default annualized TWSE Securities Borrowing and Lending (SBL / 借券) fee rate (2.0%)."""
+
+DEFAULT_HEDGE_FRICTION: float = 0.03
+"""Default dynamic delta hedging friction and 0.3% Taiwan stock transaction tax buffer (3.0%)."""
+
+DEFAULT_DESK_MARKUP: float = 0.08
+"""Default OTC derivatives trading desk profit markup over hedging breakeven (8.0%)."""
+
 
 # =====================================================================
 # Configuration Dataclasses

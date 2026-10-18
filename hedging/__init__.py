@@ -19,13 +19,15 @@ Core Classes & Functions Exposed:
 
 from .delta_hedger import (
     DeltaHedger,
-    HedgingStepRecord,
+    DeskPosition,
     HedgingSimulationResult,
+    HedgingStepRecord,
     simulate_delta_hedging,
 )
 
 __all__ = [
     "DeltaHedger",
+    "DeskPosition",
     "HedgingStepRecord",
     "HedgingSimulationResult",
     "simulate_delta_hedging",

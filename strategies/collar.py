@@ -1,128 +1,228 @@
-"""Collar (Corridor Hedge) Option Strategy Module.
+"""Zero-Cost Collar Corridor Structuring Strategy.
 
 Role:
-    Models the Collar strategy, which combines a long underlying equity/index position
-    with a protective long out-of-the-money put and an out-of-the-money short call.
-    The call premium financed either partially or entirely offsets the cost of the put,
-    establishing an affordable (or zero-cost) bounded risk-return corridor.
-    Extensively used in Taiwan equity asset management to guard against systemic drawdown
-    without paying excessive cash premiums.
-
-Dependencies:
-    - typing: Optional, Union, List
-    - numpy: Array operations for payoff grids
-    - config: Centralized system configuration
-    - models.bs_engine: OptionType
-    - .base: BaseOptionStrategy, StrategyLeg, PositionType, PayoffResult
-
-Core Classes to be Implemented:
-    - CollarStrategy: Concrete implementation of BaseOptionStrategy tailored
-      for bounded corridor payoffs, zero-cost strike optimization, and net debit/credit balance.
-
-Core Functions / Methods to be Implemented:
-    - build_legs: Construct Long Underlying, Long Put, and Short Call legs.
-    - is_zero_cost: Check if net upfront premium paid/received is within near-zero tolerance.
-    - calculate_corridor_bounds: Return lower floor (put strike) and upper ceiling (call strike).
-    - solve_zero_cost_call_strike: Solve for call strike that exactly funds the put premium.
+    Implements an institutional Collar strategy combining a core Taiwan equity
+    position (1 board lot = 1,000 shares) with a long OTM Put (downside floor)
+    financed by selling an OTM Call (upside cap). Features an automated
+    root-finding structurer (`solve_zero_cost_call`) using Brent's method
+    (`scipy.optimize.brentq`) to solve for the exact zero-cost Call strike K_c
+    that equates Call premium received to Put premium paid.
 """
 
-from typing import List, Optional, Tuple
-import numpy as np
+from __future__ import annotations
 
-from config import DEFAULT_CONFIG, SystemConfig
-from models.bs_engine import OptionType
-from .base import BaseOptionStrategy, PayoffResult, PositionType, StrategyLeg
+from typing import Any, Dict, Optional
+from scipy import optimize
+
+from models.bs_engine import BSEngine
+from .base import BaseStrategy, OptionLeg
 
 
-class CollarStrategy(BaseOptionStrategy):
-    """Collar (Corridor Hedge) Strategy Implementation."""
+class CollarStrategy(BaseStrategy):
+    """Institutional Collar (Long Stock + Long OTM Put + Short OTM Call) strategy engine."""
 
     def __init__(
         self,
-        underlying_symbol: str,
         spot_price: float,
-        put_strike: float,
-        put_premium: float,
-        call_strike: float,
-        call_premium: float,
-        expiry_years: float,
-        quantity: float = 1.0,
-        multiplier: float = 1.0,
-        config: Optional[SystemConfig] = None,
+        underlying_shares: int = 1000,
+        put_strike: Optional[float] = None,
+        call_strike: Optional[float] = None,
+        maturity_days: int = 30,
     ) -> None:
-        """Initialize CollarStrategy with underlying and two option legs.
+        """Initialize CollarStrategy with optional put and call strike bounds.
 
         Args:
-            underlying_symbol: Ticker identifier (e.g., 'TXO', '2330.TW').
-            spot_price: Current or acquisition price of underlying asset.
-            put_strike: Strike price of long protective put (floor).
-            put_premium: Premium paid per unit of put option.
-            call_strike: Strike price of short call option (ceiling).
-            call_premium: Premium received per unit of call option.
-            expiry_years: Time to expiration in years.
-            quantity: Number of underlying units/contracts.
-            multiplier: Multiplier factor for the derivative contracts.
-            config: Optional system configuration instance.
+            spot_price: Current underlying equity spot price in TWD.
+            underlying_shares: Number of underlying shares held (default 1,000 shares).
+            put_strike: Optional strike price for the protective Long Put leg.
+            call_strike: Optional strike price for the financing Short Call leg.
+            maturity_days: Days to expiration (default 30 calendar days).
         """
-        super().__init__(
-            name="Collar Strategy",
-            underlying_symbol=underlying_symbol,
-            config=config,
-        )
-        self.spot_price = spot_price
-        self.put_strike = put_strike
-        self.put_premium = put_premium
-        self.call_strike = call_strike
-        self.call_premium = call_premium
-        self.expiry_years = expiry_years
-        self.quantity = quantity
-        self.multiplier = multiplier
+        super().__init__(spot_price=spot_price, underlying_shares=underlying_shares)
 
-        self.build_legs()
+        if maturity_days <= 0:
+            raise ValueError(f"maturity_days must be strictly positive, got {maturity_days}.")
 
-    def build_legs(self, **kwargs) -> None:
-        """Construct Long Underlying, Long Put, and Short Call legs."""
-        # Leg 1: Long Underlying Asset
-        self.add_leg(
-            StrategyLeg(
-                instrument_type="underlying",
-                position_type=PositionType.LONG,
-                quantity=self.quantity,
-                entry_price=self.spot_price,
-                multiplier=self.multiplier,
+        self.maturity_days: int = int(maturity_days)
+        self.maturity: float = float(self.maturity_days) / 365.0
+        self.put_strike: Optional[float] = float(put_strike) if put_strike is not None else None
+        self.call_strike: Optional[float] = float(call_strike) if call_strike is not None else None
+
+        if self.put_strike is not None:
+            self.add_leg(
+                OptionLeg(
+                    option_type="put",
+                    position=1,
+                    strike=self.put_strike,
+                    maturity=self.maturity,
+                    contracts=1,
+                )
             )
-        )
-        # Leg 2: Long Put Option (Floor)
-        self.add_leg(
-            StrategyLeg(
-                instrument_type="option",
-                position_type=PositionType.LONG,
-                quantity=self.quantity,
-                entry_price=self.put_premium,
-                strike=self.put_strike,
-                option_type=OptionType.PUT,
-                expiry_years=self.expiry_years,
-                multiplier=self.multiplier,
+
+        if self.call_strike is not None:
+            self.add_leg(
+                OptionLeg(
+                    option_type="call",
+                    position=-1,
+                    strike=self.call_strike,
+                    maturity=self.maturity,
+                    contracts=1,
+                )
             )
-        )
-        # Leg 3: Short Call Option (Ceiling)
+
+    def _upsert_leg(self, option_type: str, position: int, strike: float) -> None:
+        """Add or replace an existing leg matching `option_type` and `position`."""
+        opt = option_type.strip().lower()
+        self.legs = [
+            leg for leg in self.legs if not (leg.option_type == opt and leg.position == position)
+        ]
         self.add_leg(
-            StrategyLeg(
-                instrument_type="option",
-                position_type=PositionType.SHORT,
-                quantity=self.quantity,
-                entry_price=self.call_premium,
-                strike=self.call_strike,
-                option_type=OptionType.CALL,
-                expiry_years=self.expiry_years,
-                multiplier=self.multiplier,
+            OptionLeg(
+                option_type=opt,
+                position=position,
+                strike=float(strike),
+                maturity=self.maturity,
+                contracts=1,
             )
         )
 
-    def is_zero_cost(self, tolerance: float = 1e-2) -> bool:
-        """Check if the strategy is zero-cost (put premium ≈ call premium)."""
-        return abs(self.put_premium - self.call_premium) <= tolerance
+    def solve_zero_cost_call(
+        self,
+        bs_engine: BSEngine,
+        target_put_strike: float,
+        r: float,
+        q: float,
+        sigma: float,
+    ) -> float:
+        """Solve for the exact Call strike K_c that yields a zero-cost collar structure.
 
-    def get_corridor_bounds(self) -> Tuple[float, float]:
-        """Return the lower floor strike and upper ceiling strike."""
-        return (self.put_strike, self.call_strike)
+        Finds K_c in [spot_price, spot_price * 2.0] such that:
+            Call_Price(S, K_c, T, r, q, sigma) - Put_Price(S, target_put_strike, T, r, q, sigma) == 0
+
+        Updates `self.put_strike`, `self.call_strike`, and synchronizes both legs in `self.legs`.
+
+        Args:
+            bs_engine: BSEngine instance for option valuation.
+            target_put_strike: Desired downside floor Put strike price.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            float: Solved zero-cost Call strike K_c.
+
+        Raises:
+            ValueError: If no zero-cost solution exists within the search bracket.
+        """
+        T = self.maturity
+        self.put_strike = float(target_put_strike)
+        self._upsert_leg(option_type="put", position=1, strike=self.put_strike)
+
+        target_put_price = float(
+            bs_engine.put_price(
+                S=self.spot_price,
+                K=self.put_strike,
+                T=T,
+                r=r,
+                q=q,
+                sigma=sigma,
+            )
+        )
+
+        def root_fn(K: float) -> float:
+            return (
+                float(bs_engine.call_price(self.spot_price, K, T, r, q, sigma))
+                - target_put_price
+            )
+
+        lower_bound = self.spot_price
+        upper_bound = self.spot_price * 2.0
+
+        # If target_put_strike is close to ATM and dividend yield > r, f(spot_price) may be < 0;
+        # fallback to a slightly wider lower bound if needed while prioritizing [spot, 2*spot]
+        f_low = root_fn(lower_bound)
+        f_high = root_fn(upper_bound)
+        if f_low * f_high > 0.0:
+            lower_bound = min(self.spot_price * 0.5, self.put_strike)
+            upper_bound = self.spot_price * 3.0
+
+        solved_strike = float(optimize.brentq(root_fn, lower_bound, upper_bound, xtol=1e-7))
+        self.call_strike = solved_strike
+        self._upsert_leg(option_type="call", position=-1, strike=self.call_strike)
+
+        return float(self.call_strike)
+
+    def evaluate(
+        self,
+        bs_engine: BSEngine,
+        r: float,
+        q: float,
+        sigma: float,
+    ) -> Dict[str, Any]:
+        """Evaluate Collar strategy premiums, max gain/loss bounds, and portfolio Greeks.
+
+        Args:
+            bs_engine: BSEngine instance for option valuation.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            dict: Complete dictionary of Collar metrics and portfolio Greeks.
+
+        Raises:
+            ValueError: If `put_strike` or `call_strike` has not been configured.
+        """
+        if self.put_strike is None:
+            self.put_strike = float(self.spot_price * 0.93)
+            self._upsert_leg(option_type="put", position=1, strike=self.put_strike)
+
+        if self.call_strike is None:
+            self.call_strike = float(self.spot_price * 1.05)
+            self._upsert_leg(option_type="call", position=-1, strike=self.call_strike)
+
+        put_price = float(
+            bs_engine.put_price(
+                S=self.spot_price,
+                K=self.put_strike,
+                T=self.maturity,
+                r=r,
+                q=q,
+                sigma=sigma,
+            )
+        )
+        call_price = float(
+            bs_engine.call_price(
+                S=self.spot_price,
+                K=self.call_strike,
+                T=self.maturity,
+                r=r,
+                q=q,
+                sigma=sigma,
+            )
+        )
+
+        net_premium_twd = float((call_price - put_price) * self.underlying_shares)
+        max_loss_pct = float(
+            (self.spot_price - self.put_strike + (put_price - call_price)) / self.spot_price
+        )
+        max_gain_pct = float(
+            (self.call_strike - self.spot_price + (call_price - put_price)) / self.spot_price
+        )
+
+        greeks = self.calculate_portfolio_greeks(bs_engine=bs_engine, r=r, q=q, sigma=sigma)
+
+        return {
+            "strategy_name": "Collar",
+            "spot_price": self.spot_price,
+            "put_strike": self.put_strike,
+            "call_strike": self.call_strike,
+            "maturity_days": self.maturity_days,
+            "put_price": put_price,
+            "call_price": call_price,
+            "net_premium_twd": net_premium_twd,
+            "max_loss_pct": max_loss_pct,
+            "max_gain_pct": max_gain_pct,
+            "portfolio_greeks": greeks,
+            **greeks,
+        }

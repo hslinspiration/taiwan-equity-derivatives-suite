@@ -1,108 +1,112 @@
-"""Protective Put Option Strategy Module.
+"""Protective Put Downside Tail-Risk Hedging Strategy.
 
 Role:
-    Models the Protective Put (Portfolio Insurance) strategy, combining a long underlying
-    equity or index position with a long out-of-the-money or at-the-money put option.
-    Widely utilized by institutional pension funds and equity portfolios in Taiwan to
-    establish a firm floor against catastrophic market selloffs while retaining
-    unlimited upside participation in the underlying asset.
-
-Dependencies:
-    - typing: Optional, Union, List
-    - numpy: Array manipulations for payoff evaluation
-    - config: Centralized system configuration
-    - models.bs_engine: OptionType
-    - .base: BaseOptionStrategy, StrategyLeg, PositionType, PayoffResult
-
-Core Classes to be Implemented:
-    - ProtectivePutStrategy: Concrete implementation of BaseOptionStrategy tailored
-      for downside risk immunization, floor protection, and hedging drag analysis.
-
-Core Functions / Methods to be Implemented:
-    - build_legs: Construct the Long Stock/Index leg and Long Put leg.
-    - calculate_max_loss: Determine strictly capped maximum loss (Spot - Strike + Put Premium).
-    - get_breakeven_points: Spot price plus paid put premium.
-    - calculate_insurance_cost_pct: Annualized cost of protection relative to portfolio value.
+    Implements an institutional Protective Put (Married Put / Portfolio Insurance)
+    overlay combining a core Taiwan equity holding (1 board lot = 1,000 shares)
+    with a long out-of-the-money (OTM) European Put option. Establishes a hard
+    downside floor price while preserving uncapped upside participation during
+    geopolitical or semiconductor cycle drawdowns.
 """
 
-from typing import List, Optional
-import numpy as np
+from __future__ import annotations
 
-from config import DEFAULT_CONFIG, SystemConfig
-from models.bs_engine import OptionType
-from .base import BaseOptionStrategy, PayoffResult, PositionType, StrategyLeg
+from typing import Any, Dict, Optional
+
+from models.bs_engine import BSEngine
+from .base import BaseStrategy, OptionLeg
 
 
-class ProtectivePutStrategy(BaseOptionStrategy):
-    """Protective Put (Portfolio Insurance) Strategy Implementation."""
+class ProtectivePutStrategy(BaseStrategy):
+    """Institutional Protective Put (Long Stock + Long OTM Put) strategy engine."""
 
     def __init__(
         self,
-        underlying_symbol: str,
         spot_price: float,
-        put_strike: float,
-        put_premium: float,
-        expiry_years: float,
-        quantity: float = 1.0,
-        multiplier: float = 1.0,
-        config: Optional[SystemConfig] = None,
+        underlying_shares: int = 1000,
+        put_strike: Optional[float] = None,
+        maturity_days: int = 30,
     ) -> None:
-        """Initialize ProtectivePutStrategy with market and trade parameters.
+        """Initialize ProtectivePutStrategy and attach the long put leg.
 
         Args:
-            underlying_symbol: Ticker symbol (e.g., '^TWII', 'TXO', '2330.TW').
-            spot_price: Entry spot price of underlying asset.
-            put_strike: Strike price of protective long put.
-            put_premium: Market premium paid per unit of put option.
-            expiry_years: Time to expiration in years.
-            quantity: Number of underlying units/contracts.
-            multiplier: Contract multiplier (e.g., 50 for TXO).
-            config: Optional system configuration instance.
+            spot_price: Current underlying equity spot price in TWD.
+            underlying_shares: Number of underlying shares held (default 1,000 shares).
+            put_strike: Put exercise strike price. Defaults to 7% OTM (`spot_price * 0.93`).
+            maturity_days: Days to expiration (default 30 calendar days).
         """
-        super().__init__(
-            name="Protective Put",
-            underlying_symbol=underlying_symbol,
-            config=config,
-        )
-        self.spot_price = spot_price
-        self.put_strike = put_strike
-        self.put_premium = put_premium
-        self.expiry_years = expiry_years
-        self.quantity = quantity
-        self.multiplier = multiplier
+        super().__init__(spot_price=spot_price, underlying_shares=underlying_shares)
 
-        self.build_legs()
+        if maturity_days <= 0:
+            raise ValueError(f"maturity_days must be strictly positive, got {maturity_days}.")
 
-    def build_legs(self, **kwargs) -> None:
-        """Construct the long underlying position and long put option leg."""
-        # Leg 1: Long Underlying Asset
-        self.add_leg(
-            StrategyLeg(
-                instrument_type="underlying",
-                position_type=PositionType.LONG,
-                quantity=self.quantity,
-                entry_price=self.spot_price,
-                multiplier=self.multiplier,
-            )
+        self.maturity_days: int = int(maturity_days)
+        self.maturity: float = float(self.maturity_days) / 365.0
+        self.put_strike: float = (
+            float(spot_price * 0.93) if put_strike is None else float(put_strike)
         )
-        # Leg 2: Long Put Option
+
         self.add_leg(
-            StrategyLeg(
-                instrument_type="option",
-                position_type=PositionType.LONG,
-                quantity=self.quantity,
-                entry_price=self.put_premium,
+            OptionLeg(
+                option_type="put",
+                position=1,
                 strike=self.put_strike,
-                option_type=OptionType.PUT,
-                expiry_years=self.expiry_years,
-                multiplier=self.multiplier,
+                maturity=self.maturity,
+                contracts=1,
             )
         )
 
-    def calculate_max_loss(self) -> float:
-        """Compute strictly capped maximum financial loss."""
-        raise NotImplementedError("calculate_max_loss will be implemented.")
+    def evaluate(
+        self,
+        bs_engine: BSEngine,
+        r: float,
+        q: float,
+        sigma: float,
+    ) -> Dict[str, Any]:
+        """Evaluate Protective Put pricing, tail-risk insurance metrics, and portfolio Greeks.
 
-    def calculate_insurance_cost_pct(self) -> float:
-        """Calculate annualized percentage drag of option premium over portfolio value."""
-        raise NotImplementedError("calculate_insurance_cost_pct will be implemented.")
+        Args:
+            bs_engine: BSEngine instance for pricing the long put leg.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            dict: Complete dictionary of strategy metrics and portfolio Greeks.
+        """
+        put_price = float(
+            bs_engine.put_price(
+                S=self.spot_price,
+                K=self.put_strike,
+                T=self.maturity,
+                r=r,
+                q=q,
+                sigma=sigma,
+            )
+        )
+
+        premium_paid_twd = float(put_price * self.underlying_shares)
+        hedging_cost_annual = float(
+            (put_price / self.spot_price) * (365.0 / self.maturity_days)
+        )
+        max_loss_pct = float(
+            (self.spot_price - self.put_strike + put_price) / self.spot_price
+        )
+        floor_price = float(self.put_strike)
+        breakeven_price = float(self.spot_price + put_price)
+
+        greeks = self.calculate_portfolio_greeks(bs_engine=bs_engine, r=r, q=q, sigma=sigma)
+
+        return {
+            "strategy_name": "Protective Put",
+            "spot_price": self.spot_price,
+            "put_strike": self.put_strike,
+            "maturity_days": self.maturity_days,
+            "put_price": put_price,
+            "premium_paid_twd": premium_paid_twd,
+            "hedging_cost_annual": hedging_cost_annual,
+            "max_loss_pct": max_loss_pct,
+            "floor_price": floor_price,
+            "breakeven_price": breakeven_price,
+            "portfolio_greeks": greeks,
+            **greeks,
+        }

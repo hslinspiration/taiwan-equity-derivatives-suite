@@ -23,15 +23,19 @@ Core Classes Exposed:
 
 from .base import (
     BaseOptionStrategy,
-    StrategyLeg,
-    PositionType,
+    BaseStrategy,
+    OptionLeg,
     PayoffResult,
+    PositionType,
+    StrategyLeg,
 )
 from .covered_call import CoveredCallStrategy
 from .protective_put import ProtectivePutStrategy
 from .collar import CollarStrategy
 
 __all__ = [
+    "BaseStrategy",
+    "OptionLeg",
     "BaseOptionStrategy",
     "StrategyLeg",
     "PositionType",

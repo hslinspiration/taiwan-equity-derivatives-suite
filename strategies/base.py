@@ -1,157 +1,208 @@
-"""Abstract Base Class for Multi-Leg Option Strategies.
+"""Foundational Strategy Abstractions and Portfolio Greek Superposition Engine.
 
 Role:
-    Defines common abstractions, interfaces, data containers, and analytical
-    methods for multi-leg equity and index option overlay strategies.
-    Standardizes terminal payoff computations, mark-to-market PnL tracking,
-    net upfront debit/credit evaluation, aggregate Greek risk aggregation,
-    and breakeven point solvers.
-
-Dependencies:
-    - abc: Abstract Base Class primitives (ABC, abstractmethod)
-    - dataclasses: Structured data representations
-    - enum: Position direction enumeration (LONG / SHORT)
-    - typing: Static typing annotations (Dict, List, Optional, Tuple, Union)
-    - numpy: Vectorized evaluation across spot price domains
-    - config: Centralized system configuration
-    - models.bs_engine: Core BSEngine and OptionType
-    - models.greeks: GreekCalculator and GreeksResult
-
-Core Classes to be Implemented:
-    - PositionType: Enum representing LONG (+1) or SHORT (-1) orientation.
-    - StrategyLeg: Dataclass defining contract specification, quantity, and entry price.
-    - PayoffResult: Dataclass capturing spot domain, gross terminal payoff, and net PnL.
-    - BaseOptionStrategy: Abstract base class enforcing interface for strategy components.
-
-Core Functions / Methods to be Implemented:
-    - add_leg: Append an underlying or option leg to the strategy composition.
-    - calculate_net_premium: Sum upfront premium received minus paid across all legs.
-    - calculate_payoff: Evaluate terminal gross and net PnL across a spot price grid.
-    - get_breakeven_points: Solve for terminal spot levels where net PnL equals zero.
-    - aggregate_greeks: Compute portfolio net Greeks (Delta, Gamma, Vega, Theta, etc.).
+    Defines the core building blocks (`OptionLeg` and `BaseStrategy`) for
+    institutional equity derivatives overlay structures in the Taiwan market
+    (1 TWSE standard board lot = 1,000 shares). Supports multi-leg expiration
+    payoff vectorization and linear superposition of analytical Black-Scholes-Merton
+    portfolio Greeks across underlying shares and option legs.
 """
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional
 import numpy as np
 
-from config import DEFAULT_CONFIG, SystemConfig
-from models.bs_engine import OptionType
-from models.greeks import GreeksResult
+from models.bs_engine import BSEngine
+from models.greeks import GreeksCalculator
 
 
-class PositionType(str, Enum):
-    """Directional positioning for a strategy leg."""
-    LONG = "long"
-    SHORT = "short"
+class PositionType(int, Enum):
+    """Direction of an option or underlying leg."""
 
-    @property
-    def sign(self) -> float:
-        """Return mathematical sign multiplier (+1.0 for Long, -1.0 for Short)."""
-        return 1.0 if self == PositionType.LONG else -1.0
-
-
-@dataclass
-class StrategyLeg:
-    """Individual instrument leg within an option strategy.
-
-    Attributes:
-        instrument_type: 'underlying' or 'option'.
-        position_type: PositionType.LONG or PositionType.SHORT.
-        quantity: Number of contracts or shares.
-        entry_price: Traded execution price or current spot basis.
-        strike: Option strike price (None for underlying).
-        option_type: OptionType.CALL or OptionType.PUT (None for underlying).
-        expiry_years: Time to expiration in years (None for underlying).
-        multiplier: Contract point multiplier (e.g., 50 for TXO, 1 for stock shares).
-    """
-    instrument_type: str  # 'underlying' or 'option'
-    position_type: PositionType
-    quantity: float
-    entry_price: float
-    strike: Optional[float] = None
-    option_type: Optional[OptionType] = None
-    expiry_years: Optional[float] = None
-    multiplier: float = 1.0
+    LONG = 1
+    SHORT = -1
 
 
 @dataclass
 class PayoffResult:
-    """Terminal payoff evaluation result.
+    """Container for vectorized strategy payoff and P&L across a spot grid."""
+
+    spot_grid: np.ndarray
+    payoff: np.ndarray
+    net_pnl: Optional[np.ndarray] = None
+
+
+@dataclass
+class OptionLeg:
+    """Represents a single option contract leg within a structured overlay.
 
     Attributes:
-        spot_range: Array of underlying prices at expiration.
-        gross_payoff: Intrinsic terminal payoff prior to initial premium.
-        net_pnl: Net profit/loss taking into account initial debit/credit.
-        max_profit: Theoretical upper bound on profit (or np.inf).
-        max_loss: Theoretical upper bound on loss (or -np.inf).
-        breakeven_points: List of underlying spot prices where net_pnl is 0.
+        option_type: 'call' or 'put' (case-insensitive).
+        position: +1 for Long, -1 for Short.
+        strike: Exercise strike price of the option.
+        maturity: Time to expiration in years (e.g., 30 / 365.0).
+        contracts: Number of option contracts / multiplier (default 1).
     """
-    spot_range: np.ndarray
-    gross_payoff: np.ndarray
-    net_pnl: np.ndarray
-    max_profit: float
-    max_loss: float
-    breakeven_points: List[float]
+
+    option_type: str
+    position: int
+    strike: float
+    maturity: float
+    contracts: int = 1
+
+    def __post_init__(self) -> None:
+        """Validate and normalize option leg parameters."""
+        normalized_type = str(self.option_type).strip().lower()
+        if normalized_type not in ("call", "put"):
+            raise ValueError(
+                f"Invalid option_type '{self.option_type}'. Must be 'call' or 'put'."
+            )
+        self.option_type = normalized_type
+
+        if int(self.position) not in (1, -1):
+            raise ValueError(
+                f"Invalid position '{self.position}'. Must be +1 (Long) or -1 (Short)."
+            )
+        self.position = int(self.position)
+        self.strike = float(self.strike)
+        self.maturity = float(self.maturity)
+        self.contracts = int(self.contracts)
 
 
-class BaseOptionStrategy(ABC):
-    """Abstract base class for all equity and index option strategies."""
+class BaseStrategy(ABC):
+    """Abstract base class for institutional equity + option overlay strategies.
 
-    def __init__(
-        self,
-        name: str,
-        underlying_symbol: str,
-        config: Optional[SystemConfig] = None,
-    ) -> None:
-        """Initialize base strategy.
+    Models a core equity holding (`underlying_shares`, defaulting to 1 Taiwan
+    board lot = 1,000 shares) combined with one or more European option legs.
+    """
+
+    def __init__(self, spot_price: float, underlying_shares: int = 1000) -> None:
+        """Initialize strategy with spot price and underlying share quantity.
 
         Args:
-            name: Human-readable strategy name.
-            underlying_symbol: Symbol of underlying asset (e.g. 'TXO', '2330.TW').
-            config: Optional system configuration instance.
+            spot_price: Current underlying equity spot price in TWD.
+            underlying_shares: Number of underlying shares held (1 TWSE board lot = 1,000 shares).
         """
-        self.name = name
-        self.underlying_symbol = underlying_symbol
-        self.config = config or DEFAULT_CONFIG
-        self.legs: List[StrategyLeg] = []
+        if spot_price <= 0.0:
+            raise ValueError(f"spot_price must be strictly positive, got {spot_price}.")
+        self.spot_price: float = float(spot_price)
+        self.underlying_shares: int = int(underlying_shares)
+        self.legs: List[OptionLeg] = []
 
-    def add_leg(self, leg: StrategyLeg) -> None:
-        """Add an execution leg to the strategy."""
+    def add_leg(self, leg: OptionLeg) -> None:
+        """Append an OptionLeg to the strategy portfolio.
+
+        Args:
+            leg: Configured OptionLeg instance.
+        """
+        if not isinstance(leg, OptionLeg):
+            raise TypeError(f"Expected OptionLeg instance, got {type(leg).__name__}.")
         self.legs.append(leg)
 
+    def calculate_payoff(self, spot_grid: np.ndarray) -> np.ndarray:
+        """Compute net terminal strategy payoff across an array of spot prices at expiration.
+
+        Note:
+            Computes terminal intrinsic value relative to initial spot entry for the
+            underlying stock plus terminal option payoffs (excluding upfront option premiums):
+                Stock Payoff = (S_T - S_0) * underlying_shares
+                Call Leg     = position * max(S_T - K, 0) * contracts * underlying_shares
+                Put Leg      = position * max(K - S_T, 0) * contracts * underlying_shares
+
+        Args:
+            spot_grid: 1D NumPy array of terminal spot prices S_T.
+
+        Returns:
+            np.ndarray: Total terminal payoff in TWD corresponding to `spot_grid`.
+        """
+        spots = np.asarray(spot_grid, dtype=float)
+        total_payoff = (spots - self.spot_price) * float(self.underlying_shares)
+
+        for leg in self.legs:
+            scale = float(leg.position * leg.contracts * self.underlying_shares)
+            if leg.option_type == "call":
+                leg_payoff = scale * np.maximum(spots - leg.strike, 0.0)
+            else:
+                leg_payoff = scale * np.maximum(leg.strike - spots, 0.0)
+            total_payoff = total_payoff + leg_payoff
+
+        return np.asarray(total_payoff, dtype=float)
+
+    def calculate_portfolio_greeks(
+        self,
+        bs_engine: BSEngine,
+        r: float,
+        q: float,
+        sigma: float,
+    ) -> Dict[str, float]:
+        """Compute net portfolio Greeks via linear superposition across stock and option legs.
+
+        Underlying stock sensitivities:
+            Delta = +1.0 * underlying_shares
+            Gamma = 0.0, Vega = 0.0, Theta = 0.0, Rho = 0.0
+
+        Each option leg's analytical per-share Greeks are scaled by:
+            leg.position * leg.contracts * self.underlying_shares
+
+        Args:
+            bs_engine: BSEngine instance.
+            r: Annualized continuously compounded risk-free interest rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            dict[str, float]: Dictionary with keys 'net_delta', 'net_gamma',
+                'net_vega', 'net_theta', and 'net_rho'.
+        """
+        _ = bs_engine  # Used for interface consistency alongside GreeksCalculator
+        net_delta: float = 1.0 * float(self.underlying_shares)
+        net_gamma: float = 0.0
+        net_vega: float = 0.0
+        net_theta: float = 0.0
+        net_rho: float = 0.0
+
+        calc = GreeksCalculator()
+
+        for leg in self.legs:
+            scale = float(leg.position * leg.contracts * self.underlying_shares)
+            leg_greeks = calc.all_greeks(
+                S=self.spot_price,
+                K=leg.strike,
+                T=leg.maturity,
+                r=r,
+                q=q,
+                sigma=sigma,
+                option_type=leg.option_type,
+            )
+            net_delta += scale * float(leg_greeks["delta"])
+            net_gamma += scale * float(leg_greeks["gamma"])
+            net_vega += scale * float(leg_greeks["vega"])
+            net_theta += scale * float(leg_greeks["theta"])
+            net_rho += scale * float(leg_greeks["rho"])
+
+        return {
+            "net_delta": float(net_delta),
+            "net_gamma": float(net_gamma),
+            "net_vega": float(net_vega),
+            "net_theta": float(net_theta),
+            "net_rho": float(net_rho),
+        }
+
     @abstractmethod
-    def build_legs(self, **kwargs) -> None:
-        """Construct the specific strategy legs based on input parameters."""
-        pass
-
-    def calculate_net_premium(self) -> float:
-        """Calculate total initial net premium cash flow (positive = credit, negative = debit)."""
-        raise NotImplementedError("calculate_net_premium will be implemented.")
-
-    def calculate_payoff(
+    def evaluate(
         self,
-        spot_range: Optional[np.ndarray] = None,
-        min_spot_pct: float = 0.80,
-        max_spot_pct: float = 1.20,
-        num_points: int = 200,
-    ) -> PayoffResult:
-        """Calculate terminal payoff and net PnL across a range of underlying spot prices."""
-        raise NotImplementedError("calculate_payoff will be implemented.")
+        bs_engine: BSEngine,
+        r: float,
+        q: float,
+        sigma: float,
+    ) -> Dict[str, Any]:
+        """Evaluate strategy pricing, institutional risk/return metrics, and portfolio Greeks."""
 
-    def aggregate_greeks(
-        self,
-        current_spot: float,
-        time_to_maturity: float,
-        volatility: float,
-        risk_free_rate: float,
-        dividend_yield: float = 0.0,
-    ) -> GreeksResult:
-        """Compute aggregate portfolio Greeks summed across all active legs."""
-        raise NotImplementedError("aggregate_greeks will be implemented.")
 
-    def get_breakeven_points(self) -> List[float]:
-        """Compute exact breakeven spot prices at expiration."""
-        raise NotImplementedError("get_breakeven_points will be implemented.")
+# Backward-compatible aliases
+BaseOptionStrategy = BaseStrategy
+StrategyLeg = OptionLeg

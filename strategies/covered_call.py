@@ -1,108 +1,112 @@
-"""Covered Call Option Strategy Module.
+"""Covered Call Yield Enhancement Overlay Strategy.
 
 Role:
-    Models the Covered Call (Buy-Write) strategy, comprising a long underlying position
-    combined with a short out-of-the-money (or at-the-money) call option.
-    Frequently deployed by institutional asset managers and retail investors in Taiwan
-    on high-dividend, blue-chip equities (e.g., TSMC 2330.TW, Chunghwa Telecom 2412.TW)
-    or TAIEX ETF (0050.TW) to generate incremental yield while capping upside.
-
-Dependencies:
-    - typing: Optional, Union, List
-    - numpy: Array operations for payoff grids
-    - config: Centralized system configuration
-    - models.bs_engine: OptionType
-    - .base: BaseOptionStrategy, StrategyLeg, PositionType, PayoffResult
-
-Core Classes to be Implemented:
-    - CoveredCallStrategy: Concrete implementation of BaseOptionStrategy tailored
-      for Covered Call analytics, annualized yield calculations, and early assignment risk.
-
-Core Functions / Methods to be Implemented:
-    - build_legs: Construct the Long Stock/Index leg and Short Call leg.
-    - calculate_annualized_yield: Compute the static and if-called return on investment.
-    - get_breakeven_points: Spot price minus received call premium.
-    - calculate_downside_protection: Percentage downside buffer provided by the call premium.
+    Implements an institutional Covered Call (Buy-Write) strategy combining a
+    core Taiwan equity holding (1 board lot = 1,000 shares) with a short
+    out-of-the-money (OTM) European Call option. Widely deployed by Taiwanese
+    insurance funds, high-dividend ETFs, and long-only equity mandates to harvest
+    volatility risk premium and monetize upside beyond target price levels.
 """
 
-from typing import List, Optional
-import numpy as np
+from __future__ import annotations
 
-from config import DEFAULT_CONFIG, SystemConfig
-from models.bs_engine import OptionType
-from .base import BaseOptionStrategy, PayoffResult, PositionType, StrategyLeg
+from typing import Any, Dict, Optional
+
+from models.bs_engine import BSEngine
+from .base import BaseStrategy, OptionLeg
 
 
-class CoveredCallStrategy(BaseOptionStrategy):
-    """Covered Call (Buy-Write) Strategy Implementation."""
+class CoveredCallStrategy(BaseStrategy):
+    """Institutional Covered Call (Long Stock + Short OTM Call) strategy engine."""
 
     def __init__(
         self,
-        underlying_symbol: str,
         spot_price: float,
-        call_strike: float,
-        call_premium: float,
-        expiry_years: float,
-        quantity: float = 1.0,
-        multiplier: float = 1.0,
-        config: Optional[SystemConfig] = None,
+        underlying_shares: int = 1000,
+        call_strike: Optional[float] = None,
+        maturity_days: int = 30,
     ) -> None:
-        """Initialize CoveredCallStrategy with market and trade parameters.
+        """Initialize CoveredCallStrategy and attach the short call leg.
 
         Args:
-            underlying_symbol: Ticker symbol (e.g., '2330.TW', 'TXO').
-            spot_price: Entry spot price of underlying asset.
-            call_strike: Strike price of short call.
-            call_premium: Market premium received per unit of short call.
-            expiry_years: Time to expiration in years.
-            quantity: Number of underlying units/contracts.
-            multiplier: Contract multiplier (e.g., 2000 for standard stock option, 50 for TXO).
-            config: Optional system configuration instance.
+            spot_price: Current underlying equity spot price in TWD.
+            underlying_shares: Number of underlying shares held (default 1,000 shares).
+            call_strike: Call exercise strike price. Defaults to 5% OTM (`spot_price * 1.05`).
+            maturity_days: Days to expiration (default 30 calendar days).
         """
-        super().__init__(
-            name="Covered Call",
-            underlying_symbol=underlying_symbol,
-            config=config,
-        )
-        self.spot_price = spot_price
-        self.call_strike = call_strike
-        self.call_premium = call_premium
-        self.expiry_years = expiry_years
-        self.quantity = quantity
-        self.multiplier = multiplier
+        super().__init__(spot_price=spot_price, underlying_shares=underlying_shares)
 
-        self.build_legs()
+        if maturity_days <= 0:
+            raise ValueError(f"maturity_days must be strictly positive, got {maturity_days}.")
 
-    def build_legs(self, **kwargs) -> None:
-        """Construct the long underlying position and short call option leg."""
-        # Leg 1: Long Underlying Asset
-        self.add_leg(
-            StrategyLeg(
-                instrument_type="underlying",
-                position_type=PositionType.LONG,
-                quantity=self.quantity,
-                entry_price=self.spot_price,
-                multiplier=self.multiplier,
-            )
+        self.maturity_days: int = int(maturity_days)
+        self.maturity: float = float(self.maturity_days) / 365.0
+        self.call_strike: float = (
+            float(spot_price * 1.05) if call_strike is None else float(call_strike)
         )
-        # Leg 2: Short Call Option
+
         self.add_leg(
-            StrategyLeg(
-                instrument_type="option",
-                position_type=PositionType.SHORT,
-                quantity=self.quantity,
-                entry_price=self.call_premium,
+            OptionLeg(
+                option_type="call",
+                position=-1,
                 strike=self.call_strike,
-                option_type=OptionType.CALL,
-                expiry_years=self.expiry_years,
-                multiplier=self.multiplier,
+                maturity=self.maturity,
+                contracts=1,
             )
         )
 
-    def calculate_annualized_yield(self) -> float:
-        """Calculate annualized static yield generated by short call premium."""
-        raise NotImplementedError("calculate_annualized_yield will be implemented.")
+    def evaluate(
+        self,
+        bs_engine: BSEngine,
+        r: float,
+        q: float,
+        sigma: float,
+    ) -> Dict[str, Any]:
+        """Evaluate Covered Call pricing, institutional yield metrics, and portfolio Greeks.
 
-    def calculate_downside_protection_pct(self) -> float:
-        """Calculate downside cushion percentage (premium / spot)."""
-        raise NotImplementedError("calculate_downside_protection_pct will be implemented.")
+        Args:
+            bs_engine: BSEngine instance for pricing the short call leg.
+            r: Annualized continuously compounded risk-free rate.
+            q: Annualized continuously compounded dividend yield.
+            sigma: Annualized volatility.
+
+        Returns:
+            dict: Complete dictionary of strategy metrics and portfolio Greeks.
+        """
+        call_price = float(
+            bs_engine.call_price(
+                S=self.spot_price,
+                K=self.call_strike,
+                T=self.maturity,
+                r=r,
+                q=q,
+                sigma=sigma,
+            )
+        )
+
+        premium_received_twd = float(call_price * self.underlying_shares)
+        yield_enhancement_annual = float(
+            (call_price / self.spot_price) * (365.0 / self.maturity_days)
+        )
+        downside_buffer_pct = float(call_price / self.spot_price)
+        max_upside_return_pct = float(
+            (self.call_strike - self.spot_price + call_price) / self.spot_price
+        )
+        breakeven_price = float(self.spot_price - call_price)
+
+        greeks = self.calculate_portfolio_greeks(bs_engine=bs_engine, r=r, q=q, sigma=sigma)
+
+        return {
+            "strategy_name": "Covered Call",
+            "spot_price": self.spot_price,
+            "call_strike": self.call_strike,
+            "maturity_days": self.maturity_days,
+            "call_price": call_price,
+            "premium_received_twd": premium_received_twd,
+            "yield_enhancement_annual": yield_enhancement_annual,
+            "downside_buffer_pct": downside_buffer_pct,
+            "max_upside_return_pct": max_upside_return_pct,
+            "breakeven_price": breakeven_price,
+            "portfolio_greeks": greeks,
+            **greeks,
+        }
